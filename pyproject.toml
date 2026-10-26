@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mule-protocol"
+version = "0.2.0"
+description = "Deterministic validation and constrained decoding for slotted JSON task blocks from local LLMs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "jsonschema"]
+
+[tool.setuptools]
+packages = ["mule"]
+
+[tool.setuptools.package-data]
+mule = ["spec/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
