@@ -103,13 +103,13 @@ nodes. `-Force` skips the budget refusal. Logs: `bridge/logs/`. The chosen mode 
 `~/.mule/mode.json` and `mule_tool.py` reads the node URLs and swap behaviour from it.
 
 **sequential (day shift).** Gemma E4B (`gemma-4-E4B-it-Q4_0.gguf` + `mmproj-gemma-4-E4B-it-BF16.gguf`,
-~6.8 GiB with overhead) and Qwen (~10 GiB) never share the card. `-Phase eyes` boots Gemma on :8081,
+~6.7 GiB with overhead) and Qwen (~9.8 GiB) never share the card. `-Phase eyes` boots Gemma on :8081,
 `-Phase worker` stops it and boots Qwen on :8080. You do not call these yourself: with `--media` the bus
 runs `eyes` before `SLOT_2_PLAN` and `worker` before `SLOT_3_EXECUTE`, and a plain edit just ensures the
 worker. A swap takes a few seconds (a full media edit measured 25 s end to end). Phases are idempotent.
 
-**concurrent.** Qwen alone is ~8.6 GiB of weights; with Gemma E4B and a 1500 MiB allowance per server the
-estimate is ~16.9 GiB against 12 GiB, so it refuses. Use sequential.
+**concurrent.** Qwen alone is ~8.4 GiB of weights; with Gemma E4B and a 1500 MiB allowance per server the
+estimate is 16,897 MiB (~16.5 GiB) against the card's 12,227 MiB, so it refuses. Use sequential.
 
 **overnight-26b (night shift).** `C:\mule_models\gemma26b` is a Gemma 4 26B A4B MoE (30 layers, 128
 experts, top-8) in **safetensors**, `gemma26b-split` is the same weights in 29 shards, and
