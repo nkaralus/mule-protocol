@@ -46,7 +46,8 @@ def syntax_check(path: Path, text: str) -> str:
     """GI_3. Check `text` as it would be saved at `path`. Returns a short note; raises PatchError."""
     suffix = path.suffix.lower()
     with tempfile.TemporaryDirectory(prefix="mule_check_") as d:
-        tmp = Path(d) / path.name
+        # .js is checked as ESM (.mjs): the temp dir has no package.json, so Node would parse imports as CommonJS
+        tmp = Path(d) / (path.stem + ".mjs" if suffix == ".js" else path.name)
         tmp.write_bytes(text.encode("utf-8"))
         if suffix == ".py":
             try:
@@ -60,7 +61,8 @@ def syntax_check(path: Path, text: str) -> str:
             except FileNotFoundError:
                 return "node not found, syntax check SKIPPED"
             if r.returncode != 0:
-                msg = (r.stderr.strip().splitlines() or ["syntax error"])[-1]
+                errs = r.stderr.strip().splitlines() or ["syntax error"]
+                msg = next((x.strip() for x in errs if "Error" in x), errs[-1])
                 raise PatchError(f"node --check failed: {msg}")
             return "node --check"
         if suffix == ".json":
