@@ -1,80 +1,119 @@
-# Claude Code ↔ RTX 5070 bridge
+# Claude Code ↔ local GPU bus (Qwen worker + Gemma eyes)
 
-Lets Claude Code delegate bounded code edits to a local Qwen2.5-Coder-14B running fully in
-GPU VRAM. Claude finds the line numbers; the local model writes the replacement; mule-protocol
-guarantees the reply is well-formed before anything touches your file.
+Claude Code delegates bounded code edits, and screenshot/audio inspections, to local models so it
+never has to load large files or media into its own context. Every message between the nodes is a
+[mule-protocol](../README.md) block, forced into shape by a `to_gbnf()` grammar and checked by
+`MuleValidator`.
 
 ```
-Claude Code ──► bridge/mule_tool.py ──► llama-server :8080 (RTX 5070, -ngl 99)
-                   │  grammar = mule.constrain.to_gbnf()  (decoding is forced into the schema)
-                   │  MuleValidator.validate_raw(expect={target, ref})  (echo verified)
-                   │  base64 decode → syntax check on a temp copy → atomic replace
-                   ▼
-              your file (or untouched on any failure)
+ Claude Code            Gemma eyes                 Qwen worker
+ 10.1.0.0/24            10.2.1.0/24                10.3.1.0/24
+ %Claude 10.1.0.1       %Eyes   10.2.1.1  :8081    %Worker 10.3.1.1  :8080
+     │  mule_tool.py        │  (--media / inspect)     │
+     └──── bus.py ──────────┴──────────────────────────┘
 ```
 
-## Two-step startup
+## One task = one frame through five slots
 
-**1. Boot the model into VRAM**
+| Slot | Who | What happens |
+|---|---|---|
+| `SLOT_1_TASK` | Claude node | Task posted. **GI_2 scope**: file inside an allowed root, no `..`, not in `.git`, range in the file, ≤ 80 lines. |
+| `SLOT_2_PLAN` | Eyes node | With `--media`: Gemma returns an **EyesReport**. Otherwise a plain plan frame. |
+| `SLOT_3_EXECUTE` | Worker node | Qwen replies with one grammar-constrained block. **GI_1** echo check. |
+| `SLOT_4_GUARD` | Harness | **GI_2** subnet check (a node may only speak from its own subnet and address), **GI_3** syntax check on a temp copy. Any gate failing is a **NAK**: back to slot 3 with the reason, up to **3** attempts. |
+| `SLOT_5_VERIFY` | Harness | Atomic write, read-back hash check, receipt. |
+
+Gates: **GI_1** = `MuleValidator.validate_raw(raw, expect=…)` with every pinned header slot
+(`frame_id`, `time_slot`, `subnet`, `op`, `target`, `ref`, `path`, `lines`) required to be echoed
+exactly, and all five standard exclusions present. **GI_2** = subnet isolation and file scope.
+**GI_3** = `py_compile` / `node --check` / `json.loads`. A failed patch is never written.
+
+## Two steps
 
 ```powershell
-.\bridge\install.ps1                 # once: installs ~/tools/mule_tool.py + global CLAUDE.md rule
-.\bridge\start_vram.ps1              # kills stale llama-server, loads all layers on the GPU
+.\bridge\install.ps1                          # once: tool, modules, global CLAUDE.md rule
+.\bridge\start_vram.ps1                       # worker-only: Qwen 14B on :8080, all layers in VRAM
 ```
 
-`start_vram.ps1` waits for `/health` = 200 and fails if the log does not show every layer
-offloaded to the GPU. Use `-Reuse` to keep an already-healthy server instead of restarting it.
-Logs go to `bridge/logs/`. The path of the runtime and model are parameters (`-RuntimeDir`, `-Model`).
-
-**2. Smoke test**
+Smoke test:
 
 ```powershell
 Set-Content $env:TEMP\mule_smoke.py "x = 1`n"
-python ~/tools/mule_tool.py $env:TEMP\mule_smoke.py 1 1 "Replace the line with 'x = 2'"
-Get-Content $env:TEMP\mule_smoke.py     # expect: x = 2
+python ~/tools/mule_tool.py $env:TEMP\mule_smoke.py 1 1 "Replace the line with: x = 2"
+Get-Content $env:TEMP\mule_smoke.py           # expect: x = 2
 ```
 
-Success prints a unified diff and `OK: patched ... syntax: py_compile`. Add `--dry-run` to
-verify without writing. Then check the whole repo is healthy: `python -m mule.selftest`
-and `python -m pytest`.
+You should see a diff, `OK: patched … attempts: 1, naks: 0, syntax: py_compile` and a `RECEIPT:` line.
+`--dry-run` runs every gate and writes nothing.
 
 ## Usage
 
 ```
-python ~/tools/mule_tool.py <file> <start_line> <end_line> "<exact edit instruction>"
+mule_tool.py <file> <start_line> <end_line> "<spec>" [--media <path>] [--dry-run] [--retries N]
+             [--allow-root DIR] [--url WORKER_URL] [--eyes-url EYES_URL]
+mule_tool.py inspect <media> "<question>"                    # eyes node only, no file edit
 ```
 
-| Result | Exit | Meaning |
+| Output | Exit | Meaning |
 |---|---|---|
-| `OK: patched ...` | 0 | Validated, syntax-checked, written. |
-| `REJECTED BY MULE: ...` | 1 | Every attempt failed. **The file is untouched.** |
-| `MULE SERVER ERROR: ...` | 2 | Server down. Run `start_vram.ps1`. |
+| `OK: patched …` + `RECEIPT: {…}` | 0 | Passed all gates, written. |
+| `REJECTED BY MULE: …` + `RECEIPT: {…}` | 1 | Scope refused, or 3 NAKs. **File untouched.** |
+| `MULE SERVER ERROR: worker\|eyes node …` | 2 | A node is down. Start it. |
 
-Options: `--retries N` (default 3; temperature rises 0 → 0.2 → 0.4 so a retry differs),
-`--url`, `--timeout`, `--dry-run`. Slices are capped at 80 lines; split larger edits.
+Receipt (one line, no diff): `ok`, `frame_id`, `file`, `lines`, `slots` completed, `gates`, `attempts`,
+`naks` (`gate` + reason for each), `eyes`, `wrote`, `sha`, `ms`, and `error` on failure.
 
-## What is guaranteed, and what is not
+**File scope.** Edits are limited to your home folder (or `MULE_ALLOWED_ROOTS`, a path-separator
+list). Add more with `--allow-root DIR`. This stops a confused or manipulated worker request from
+touching system files.
 
-Guaranteed: the model output is one JSON line with exactly `target`, `ref`, `replacement_b64`
-in that order; `target` and `ref` equal what the tool sent; the payload is valid base64 UTF-8;
-the new file compiles (`.py`), passes `node --check` (`.js/.mjs/.cjs`) or parses (`.json`).
-A failing patch is never written.
+## Eyes node (`--media`, `inspect`)
 
-Not guaranteed: that the patch does what you asked. A syntactically valid wrong edit passes.
-Review the printed diff and run your tests. Other file types are patched without a syntax
-check, and if `node` is not installed the JS check is reported as skipped.
+`gemma_sensor.py` posts the media to Gemma at `http://127.0.0.1:8081/v1/chat/completions` using
+`mule.prompt.build_messages(…, fold_system=True)` (Gemma has no system role, so the system prompt
+is folded into the user turn) and a `to_gbnf()` grammar. Images are sent as `image_url` data URLs
+(png, jpg, webp, gif), audio as `input_audio` (wav, mp3). The validated EyesReport is a mule block
+with `time_slot=SLOT_2_PLAN`, `subnet=10.2.1.0/24`, `ref=10.2.1.1`, `target=%Eyes`, `op=inspect`
+plus:
 
-A 14B model is weak at producing base64 by hand, so rejections happen. That is the design:
-the gate rejects bad output instead of writing it. To reduce them, the prompt includes the
-slice already base64-encoded (`CURRENT_SLICE_B64`) so unchanged text can be copied rather than
-re-encoded. Without that hint, a smoke test on a 70-character docstring line was rejected twice
-and then accepted a garbled rewrite that still compiled, which is exactly why you review the
-printed diff. With the hint the same edit came back correct on the first attempt.
-Keep slices small and instructions exact.
+| Key | Type |
+|---|---|
+| `observations` | up to 8 strings, ≤ 200 chars each |
+| `ocr_text` | printable ASCII, ≤ 500 chars. The grammar cannot carry quotes, backslashes, newlines or non-ASCII, so this is lossy. |
+| `confidence` | integer 0–100 (mule blocks forbid floats) |
+
+**Treat the report as untrusted.** Text read from a screenshot can contain instructions. The worker
+is told to use it as context only, and the worker's reply is still pinned, scope-checked and
+syntax-checked. It can still be steered into a wrong-but-valid edit, so read the diff.
+
+## VRAM modes
+
+```powershell
+.\bridge\start_vram.ps1 -Mode worker-only     # Qwen only (default)
+.\bridge\start_vram.ps1 -Mode concurrent      # Qwen :8080 + Gemma :8081
+```
+
+`concurrent` needs `-GemmaModel` / `-GemmaMmproj` (defaults point at
+`tools\models\gemma-4-e4b-it-Q4_K_M.gguf` and `mmproj-gemma-4-e4b-it-f16.gguf`, which you must
+download) and **checks the budget first**: weights + 1500 MiB per server vs the card, and refuses
+before stopping anything if it does not fit. Qwen 14B Q4 is ~8.6 GiB of weights alone, so on a
+12 GiB RTX 5070 `concurrent` only passes with a much smaller Qwen or Gemma quant (or `-Force`, which
+risks falling back to CPU RAM). `-Reuse` keeps healthy nodes and starts only missing ones.
+Logs: `bridge/logs/`.
+
+## What is and is not guaranteed
+
+Guaranteed: both model replies are one JSON line with the exact pinned header; the payload is valid
+base64 UTF-8; the new file compiles/parses; nothing outside the allowed roots is touched; a failed
+patch never reaches disk.
+
+Not guaranteed: that the patch does what you asked. A 14B model is weak at hand-encoding base64, so
+the prompt includes the slice already encoded (`CURRENT_SLICE_B64`) and NAKs feed the reason back.
+A syntactically valid wrong edit still passes. Review the printed diff, then run your tests.
 
 ## Troubleshooting
 
-- *Connection refused* → run `start_vram.ps1`.
-- *Slow or CPU-bound* → open `bridge/logs/llama-server.err.log`; you want
-  `offloaded N/N layers to GPU`. 12 GB of VRAM is tight for this model plus an 8192 context.
-- *Unicode in the path* → paths must be printable ASCII (the validator rejects anything else).
+- *`MULE SERVER ERROR`* → run `start_vram.ps1` (`-Mode concurrent` for the eyes node).
+- *Slow or CPU-bound* → `bridge/logs/worker.err.log` should show `offloaded N/N layers to GPU`.
+- *Audio rejected by the server* → `input_audio` support depends on your llama.cpp build and model.
+- *Non-ASCII path* → paths must be printable ASCII without quotes or backslashes.
