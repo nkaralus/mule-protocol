@@ -89,17 +89,52 @@ syntax-checked. It can still be steered into a wrong-but-valid edit, so read the
 ## VRAM modes
 
 ```powershell
-.\bridge\start_vram.ps1 -Mode worker-only     # Qwen only (default)
-.\bridge\start_vram.ps1 -Mode concurrent      # Qwen :8080 + Gemma :8081
+.\bridge\start_vram.ps1 -Mode worker-only     # Qwen 14B :8080 (default)
+.\bridge\start_vram.ps1 -Mode sequential      # day shift: one model in VRAM at a time
+.\bridge\start_vram.ps1 -Mode concurrent      # Qwen :8080 + Gemma E4B :8081 (does not fit on 12 GiB)
+.\bridge\start_vram.ps1 -Mode overnight-26b   # night shift: Gemma 4 26B A4B for both roles (needs a GGUF)
 ```
 
-`concurrent` needs `-GemmaModel` / `-GemmaMmproj` (defaults point at
-`tools\models\gemma-4-e4b-it-Q4_K_M.gguf` and `mmproj-gemma-4-e4b-it-f16.gguf`, which you must
-download) and **checks the budget first**: weights + 1500 MiB per server vs the card, and refuses
-before stopping anything if it does not fit. Qwen 14B Q4 is ~8.6 GiB of weights alone, so on a
-12 GiB RTX 5070 `concurrent` only passes with a much smaller Qwen or Gemma quant (or `-Force`, which
-risks falling back to CPU RAM). `-Reuse` keeps healthy nodes and starts only missing ones.
-Logs: `bridge/logs/`.
+Every mode runs a **preflight before stopping anything** (files exist, VRAM/RAM budget), stops stale
+`llama-server` processes, launches the Vulkan build with `-ngl 99`, waits for `/health`, and checks
+the weights really went to the GPU (the `offloaded N/N` log line, or, on builds that log quietly, VRAM
+growing by about the model size). `-DryRun` prints the plan and changes nothing. `-Reuse` keeps healthy
+nodes. `-Force` skips the budget refusal. Logs: `bridge/logs/`. The chosen mode is saved to
+`~/.mule/mode.json` and `mule_tool.py` reads the node URLs and swap behaviour from it.
+
+**sequential (day shift).** Gemma E4B (`gemma-4-E4B-it-Q4_0.gguf` + `mmproj-gemma-4-E4B-it-BF16.gguf`,
+~6.8 GiB with overhead) and Qwen (~10 GiB) never share the card. `-Phase eyes` boots Gemma on :8081,
+`-Phase worker` stops it and boots Qwen on :8080. You do not call these yourself: with `--media` the bus
+runs `eyes` before `SLOT_2_PLAN` and `worker` before `SLOT_3_EXECUTE`, and a plain edit just ensures the
+worker. A swap takes a few seconds (a full media edit measured 25 s end to end). Phases are idempotent.
+
+**concurrent.** Qwen alone is ~8.6 GiB of weights; with Gemma E4B and a 1500 MiB allowance per server the
+estimate is ~16.9 GiB against 12 GiB, so it refuses. Use sequential.
+
+**overnight-26b (night shift).** `C:\mule_models\gemma26b` is a Gemma 4 26B A4B MoE (30 layers, 128
+experts, top-8) in **safetensors**, `gemma26b-split` is the same weights in 29 shards, and
+`gemma26b-int8experts` is a custom `layer_*.bin` format. llama-server loads only GGUF, so none of them
+can be launched as they are. The script expects a GGUF and mmproj (`-Big26bModel`, `-Big26bMmproj`;
+defaults under `C:\mule_models\gemma26b-gguf\`) and prints the exact `convert_hf_to_gguf.py` +
+`llama-quantize` steps if they are missing. Once present it runs **one** server on :8080 that serves both
+roles (the bus is pointed at it for eyes too, since two copies of a 26B cannot fit in 16 GiB of RAM).
+Hot experts stay in VRAM: `--n-cpu-moe N` keeps the experts of the first N layers in RAM
+(N = 30 - `-HotExpertLayers`, default 8 hot), or pass your own `-OverrideTensor` pattern. The budget
+check estimates VRAM and RAM and is tight on this machine; treat it as a guide, not a guarantee.
+
+## DLQ (`bridge/dlq.jsonl`)
+
+A task that uses up its NAK retries (3 by default), or gets an invalid eyes report, is appended as one JSON
+line: timestamp, kind (`worker_naks` / `eyes_invalid`), frame id, file, line range, the instruction (first
+300 chars), media file name, every NAK gate and reason, and the mode. File contents are never copied. It
+is gitignored and local. `python ~/tools/mule_tool.py dlq --tail 20` lists it. `MULE_DLQ` overrides the path.
+
+## Status and media rule
+
+`python ~/tools/mule_tool.py status` prints `STATUS: {"mode", "worker", "eyes", ...}` where each node is
+`up`, `down`, or `on-demand` (sequential mode boots it when needed). The global CLAUDE.md rule uses it:
+delegate media to `inspect` / `--media` whenever the eyes node is `up` or `on-demand`, and only inspect an
+image directly when it is `down`, saying that the local sensor was offline.
 
 ## What is and is not guaranteed
 

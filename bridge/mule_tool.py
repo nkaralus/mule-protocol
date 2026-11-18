@@ -3,6 +3,8 @@
 
     mule_tool.py <file> <start_line> <end_line> "<spec>" [--media <path>]   patch a line slice
     mule_tool.py inspect <media> "<question>"                               look at media only
+    mule_tool.py status                                                     which nodes can serve now
+    mule_tool.py dlq [--tail N]                                             failed tasks (dlq.jsonl)
 
 A patch runs through bridge/bus.py (SLOT_1_TASK .. SLOT_5_VERIFY, gates GI_1..GI_3, up to 3 NAK
 retries on the worker) and prints a unified diff, an `OK:` / `REJECTED BY MULE:` line and a one-line
@@ -33,15 +35,15 @@ import gemma_sensor  # noqa: E402
 
 
 def _common(ap: argparse.ArgumentParser) -> None:
-    ap.add_argument("--url", default=os.environ.get("MULE_URL", bus.DEFAULT_WORKER_URL), help="worker (Qwen)")
-    ap.add_argument("--eyes-url", default=os.environ.get("MULE_EYES_URL", bus.DEFAULT_EYES_URL),
-                    help="sensor (Gemma)")
+    worker_url, eyes_url = bus.default_urls()   # env, then the mode file start_vram.ps1 wrote, then defaults
+    ap.add_argument("--url", default=worker_url, help="worker (Qwen, or the 26B in overnight mode)")
+    ap.add_argument("--eyes-url", default=eyes_url, help="sensor (Gemma)")
     ap.add_argument("--timeout", type=float, default=300.0)
 
 
 def _server_error(e: bus.NodeDown) -> int:
-    hint = "-Mode concurrent" if e.node == "eyes" else "-Mode worker-only"
-    print(f"MULE SERVER ERROR: {e}. Start it with bridge/start_vram.ps1 {hint}")
+    print(f"MULE SERVER ERROR: {e}. Start it with bridge/start_vram.ps1 "
+          f"-Mode worker-only | sequential | concurrent | overnight-26b")
     return 2
 
 
@@ -52,7 +54,12 @@ def cmd_inspect(argv: List[str]) -> int:
     _common(ap)
     a = ap.parse_args(argv)
     try:
+        swap = bus.swapper()
+        if swap:
+            swap("eyes")   # sequential mode: only one model fits in VRAM, boot the sensor now
         report = gemma_sensor.inspect(a.media, a.question, url=a.eyes_url, timeout=a.timeout)
+    except bus.NodeDown as e:
+        return _server_error(e)
     except gemma_sensor.SensorError as e:
         print(f"REJECTED BY MULE: eyes node: {e}")
         return 1
@@ -83,7 +90,8 @@ def cmd_patch(argv: List[str]) -> int:
     try:
         rec = bus.run_task(a.file, a.start_line, a.end_line, a.spec, media=a.media, roots=roots,
                            url=a.url, eyes_url=a.eyes_url, model=a.model, retries=a.retries,
-                           timeout=a.timeout, dry_run=a.dry_run, log=lambda s: print(s, file=sys.stderr))
+                           timeout=a.timeout, dry_run=a.dry_run, swap=bus.swapper(),
+                           log=lambda s: print(s, file=sys.stderr))
     except bus.NodeDown as e:
         return _server_error(e)
     if rec["ok"]:
@@ -93,15 +101,35 @@ def cmd_patch(argv: List[str]) -> int:
         print(f"OK: {verb} {rec['file']} [{rec['lines']}] attempts: {rec['attempts']}, "
               f"naks: {len(rec['naks'])}, syntax: {rec['gates'].get('GI_3')}")
     else:
-        print(f"REJECTED BY MULE: {rec['error']}. File untouched.")
+        print(f"REJECTED BY MULE: {rec['error']}. File untouched."
+              + (f" Logged to the DLQ: {rec['dlq']}" if rec.get("dlq") else ""))
     print("RECEIPT: " + bus.receipt_json(rec))
     return 0 if rec["ok"] else 1
 
 
+def cmd_status(argv: List[str]) -> int:
+    """One JSON line. eyes/worker are up | down | on-demand (sequential mode boots them when needed)."""
+    argparse.ArgumentParser(prog="mule_tool.py status").parse_args(argv)
+    print("STATUS: " + json.dumps(bus.node_status(), separators=(",", ":")))
+    return 0
+
+
+def cmd_dlq(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(prog="mule_tool.py dlq")
+    ap.add_argument("--tail", type=int, default=20)
+    a = ap.parse_args(argv)
+    entries = bus.read_dlq(a.tail)
+    print(f"DLQ: {len(entries)} shown from {bus.dlq_path().as_posix()}")
+    for e in entries:
+        print(json.dumps(e, separators=(",", ":")))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] == "inspect":
-        return cmd_inspect(argv[1:])
+    cmds = {"inspect": cmd_inspect, "status": cmd_status, "dlq": cmd_dlq}
+    if argv and argv[0] in cmds:
+        return cmds[argv[0]](argv[1:])
     return cmd_patch(argv)
 
 

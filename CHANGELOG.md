@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- `start_vram.ps1`: `-Mode sequential` (one model in VRAM at a time; `-Phase eyes|worker`, called by the bus
+  before each slot) and `-Mode overnight-26b` (one Gemma 4 26B A4B MoE server for both roles, hot experts in
+  VRAM via `--n-cpu-moe` / `-OverrideTensor`; needs a GGUF). `-DryRun` plans without touching anything.
+  The chosen mode is saved to `~/.mule/mode.json`; `mule_tool.py` reads URLs and swap behaviour from it.
+- `bus.py` / `mule_tool.py`: persistent DLQ (`bridge/dlq.jsonl`) for 3-strike NAK and invalid-eyes failures,
+  `mule_tool.py status` and `dlq`, node swaps for sequential mode. Global CLAUDE.md rule: delegate media when
+  the sensor is up or on-demand, inspect directly only when it is down.
 - `bridge/` is now a 3-node TDMA bus: Claude 10.1.0.0/24, Gemma eyes 10.2.1.0/24 (`gemma_sensor.py`,
   `--media` / `inspect`), Qwen worker 10.3.1.0/24. Five slots (`SLOT_1_TASK` .. `SLOT_5_VERIFY`), gates
   GI_1 echo / GI_2 subnet+file scope / GI_3 syntax, up to 3 NAK retries, compact JSON receipt.

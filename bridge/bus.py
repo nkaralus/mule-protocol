@@ -16,14 +16,18 @@ from __future__ import annotations
 
 import base64
 import copy
+import datetime
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from patching import (PatchError, apply_slice, b64, read_lines, sha12, syntax_check,
                       unified_diff, write_atomic)
@@ -79,6 +83,110 @@ class NodeDown(Exception):
     def __init__(self, node: str, url: str, cause: Exception):
         super().__init__(f"{node} node at {url} is not answering ({cause})")
         self.node, self.url = node, url
+
+
+# ---- run mode, node status, node swaps, DLQ ---------------------------------
+def mode_file() -> Path:
+    return Path(os.environ.get("MULE_MODE_FILE") or Path.home() / ".mule" / "mode.json")
+
+
+def load_mode() -> Dict[str, Any]:
+    """What start_vram.ps1 last booted: {"mode", "worker_url", "eyes_url", "script"}. {} if unknown."""
+    try:
+        return json.loads(mode_file().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+
+
+def default_urls() -> Tuple[str, str]:
+    """(worker, eyes). Environment beats the mode file beats the built-in defaults."""
+    m = load_mode()
+    return (os.environ.get("MULE_URL") or m.get("worker_url") or DEFAULT_WORKER_URL,
+            os.environ.get("MULE_EYES_URL") or m.get("eyes_url") or DEFAULT_EYES_URL)
+
+
+def healthy(url: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as r:
+            return r.status == 200
+    except (OSError, ValueError):
+        return False
+
+
+def node_status() -> Dict[str, Any]:
+    """Which nodes can serve right now. `on-demand` = sequential mode will boot it when needed."""
+    mode = load_mode().get("mode")
+    worker_url, eyes_url = default_urls()
+    on_demand = "on-demand" if mode == "sequential" else "down"
+    return {"mode": mode or "unknown", "worker_url": worker_url, "eyes_url": eyes_url,
+            "worker": "up" if healthy(worker_url) else on_demand,
+            "eyes": "up" if healthy(eyes_url) else on_demand}
+
+
+def swapper() -> Optional[Callable[[str], None]]:
+    """In sequential mode only one model fits in VRAM, so the bus boots each node when its slot comes."""
+    m = load_mode()
+    if m.get("mode") != "sequential":
+        return None
+    script = m.get("script", "")
+
+    def swap(phase: str) -> None:
+        node = "eyes" if phase == "eyes" else "worker"
+        if not script or not Path(script).is_file():
+            raise NodeDown(node, script or "start_vram.ps1", FileNotFoundError("start_vram.ps1 path unknown"))
+        # Output goes to a FILE, not a pipe: the llama-server the script starts is long-lived and inherits
+        # the pipe, so subprocess.run(capture_output=True) would wait for an EOF that never comes.
+        with tempfile.TemporaryFile() as out:
+            try:
+                rc = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+                                     "-Mode", "sequential", "-Phase", phase],
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                    timeout=900).returncode
+            except (OSError, subprocess.TimeoutExpired) as e:
+                raise NodeDown(node, script, e) from None
+            if rc != 0:
+                out.seek(0)
+                lines = out.read().decode("utf-8", "replace").strip().splitlines()
+                raise NodeDown(node, script, RuntimeError((lines[-1] if lines else f"exit code {rc}")[:200]))
+    return swap
+
+
+def dlq_path() -> Path:
+    return Path(os.environ.get("MULE_DLQ") or Path(__file__).resolve().parent / "dlq.jsonl")
+
+
+def dlq_append(rec: Dict[str, Any], instruction: str, media: Optional[str], kind: str) -> Optional[str]:
+    """Persist a failed task (all NAK retries used, or an invalid eyes report) as one JSON line.
+    Holds the instruction and the NAK reasons, never the file contents. Returns the path, or None."""
+    entry = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+             "kind": kind, "frame_id": rec["frame_id"], "file": rec["file"], "lines": rec["lines"],
+             "instruction": instruction[:300], "media": Path(media).name if media else None,
+             "attempts": rec["attempts"], "naks": rec["naks"], "error": rec.get("error"),
+             "mode": load_mode().get("mode")}
+    try:
+        p = dlq_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return p.as_posix()
+    except OSError:
+        return None
+
+
+def read_dlq(tail: int = 20) -> List[Dict[str, Any]]:
+    try:
+        lines = dlq_path().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-tail:]:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            out.append({"corrupt": ln[:120]})
+    return out
 
 
 # ---- specs and frames -------------------------------------------------------
@@ -238,10 +346,13 @@ def run_task(
     url: str = DEFAULT_WORKER_URL, eyes_url: str = DEFAULT_EYES_URL, model: str = DEFAULT_MODEL,
     retries: int = MAX_RETRIES, timeout: float = 300.0, dry_run: bool = False,
     generate: Optional[Callable[..., str]] = None, look: Optional[Callable[..., Dict[str, Any]]] = None,
+    swap: Optional[Callable[[str], None]] = None,
     frame_id: Optional[str] = None, log: Callable[[str], None] = lambda s: None,
 ) -> Dict[str, Any]:
     """Run one task through the five slots. Returns a receipt; never raises for a rejected patch.
-    Raises NodeDown when a model server cannot be reached."""
+    Raises NodeDown when a model server cannot be reached. `swap("eyes"|"worker")` is called before the
+    slot that needs that node (sequential mode: one model in VRAM at a time). A task that uses up its
+    NAK retries, or gets an invalid eyes report, is appended to the DLQ (dlq.jsonl)."""
     t0 = time.monotonic()
     fid = frame_id or new_frame_id()
     retries = max(1, min(retries, MAX_RETRIES))
@@ -255,6 +366,17 @@ def run_task(
             rec["error"] = error
         rec["ms"] = int((time.monotonic() - t0) * 1000)
         return rec
+
+    def done_dlq(kind: str, error: str) -> Dict[str, Any]:
+        r = done(error)
+        r["dlq"] = dlq_append(r, instruction, media, kind)
+        return r
+
+    def swap_to(phase: str) -> None:
+        if swap:
+            log(f"swap: booting the {phase} node")
+            swap(phase)
+            rec.setdefault("swaps", []).append(phase)
 
     def advance(slot: str, node: Node, op: str) -> None:
         node_frame = frame(node, slot, op, fid)
@@ -280,11 +402,12 @@ def run_task(
     sensor = None
     if media:
         import gemma_sensor
+        swap_to("eyes")
         try:
             sensor = (look or gemma_sensor.inspect)(media, instruction, frame_id=fid, url=eyes_url,
                                                     timeout=timeout)
         except gemma_sensor.SensorError as e:
-            return done(f"eyes node rejected: {e}")
+            return done_dlq("eyes_invalid", f"eyes node rejected: {e}")
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             raise NodeDown("eyes", eyes_url, e) from None
         rec["eyes"] = {k: sensor[k] for k in ("ref", "observations", "ocr_text", "confidence")}
@@ -294,6 +417,7 @@ def run_task(
         advance("SLOT_2_PLAN", NODES["claude"], "plan")
 
     # SLOT_3_EXECUTE <-> SLOT_4_GUARD, with local NAK retries.
+    swap_to("worker")
     spec = exec_spec(fid, posix, ref)
     grammar = to_gbnf(spec)
     current = "".join(lines[start - 1:end])
@@ -331,7 +455,7 @@ def run_task(
             log(f"NAK {n.gate} (attempt {attempt}/{retries}): {n.reason}")
     if new_text is None:
         last = rec["naks"][-1]
-        return done(f"{retries} NAKs, last {last['gate']}: {last['why']}")
+        return done_dlq("worker_naks", f"{retries} NAKs, last {last['gate']}: {last['why']}")
     rec["slots"] += ["SLOT_3_EXECUTE", "SLOT_4_GUARD"]
 
     # SLOT_5_VERIFY: atomic write, read-back check.
