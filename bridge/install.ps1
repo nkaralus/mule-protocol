@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   ~/tools/mule_tool.py            CLI entrypoint
-  ~/tools/mule_bridge/*.py        bus.py, gemma_sensor.py, patching.py (found by mule_tool.py)
+  ~/tools/mule_bridge/*.py        bus.py, gemma_sensor.py, patching.py, completion.py (found by mule_tool.py)
 
   Idempotent. The rule lives between BEGIN/END markers and is replaced in place on re-runs;
   everything else in CLAUDE.md is left alone. A legacy un-marked
@@ -20,7 +20,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # 1. Tool + modules.
-$modules = "bus.py", "gemma_sensor.py", "patching.py"
+$modules = "bus.py", "gemma_sensor.py", "patching.py", "completion.py"
 foreach ($f in @("mule_tool.py") + $modules) {
     if (-not (Test-Path (Join-Path $PSScriptRoot $f))) { throw "missing $(Join-Path $PSScriptRoot $f)" }
 }

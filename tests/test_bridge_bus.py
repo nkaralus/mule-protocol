@@ -26,9 +26,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 def reply_for(messages, text):
     """What a well-behaved worker answers: the FRAME from the last user turn, with the payload filled in."""
     line = next(l for l in messages[-1]["content"].splitlines() if l.startswith("FRAME: "))
-    block = json.loads(line[len("FRAME: "):])
-    block["replacement_b64"] = base64.b64encode(text.encode()).decode()
-    return bus.compact(block)
+    return bus.envelope(json.loads(line[len("FRAME: "):]), text)
 
 
 def says(text):
@@ -131,7 +129,10 @@ def test_exec_grammar_pins_header_and_orders_keys():
     for pinned in ('("0x0042")', '("SLOT_3_EXECUTE")', '("10.3.1.0/24")', '("patch_slice")',
                    '("%Worker")', '("10.3.1.1")', '("C:/a/b.py")', '("3:5")'):
         assert pinned in g
-    assert "[A-Za-z0-9+/=]*" in g and "{4,4}" in g
+    assert "replacement" not in g and "{4,4}" in g   # no payload slot: code never rides in the block
+    full = bus.exec_grammar(bus.exec_spec(FID, "C:/a/b.py", "3:5"))
+    assert full.startswith(f'root ::= header "\\n" "{bus.BODY_OPEN}" "\\n" body "{bus.BODY_CLOSE}"')
+    assert 'header ::= "{"' in full and "body ::= [^\\x00]*" in full and full.count("root ::=") == 1
 
 
 def test_node_spec_rejects_unknown_slot_or_op():
@@ -150,7 +151,7 @@ def test_harness_frames_obey_the_protocol():
 
 # ---- GI_1: MuleValidator echo check ----------------------------------------
 SPEC = bus.exec_spec(FID, "C:/a/b.py", "3:5")
-GOOD = bus.exec_block(FID, "C:/a/b.py", "3:5", "hi\n")
+GOOD = bus.exec_block(FID, "C:/a/b.py", "3:5")
 
 
 def mutate(**over):
@@ -167,7 +168,7 @@ def test_gi1_accepts_a_correct_block():
     mutate(frame_id="0x0043"), mutate(lines="3:6"), mutate(path="C:/other.py"), mutate(ref="10.1.0.1"),
     mutate(subnet="10.1.0.0/24"), mutate(time_slot="SLOT_1_TASK"), mutate(op="inspect"),
     mutate(target="%Eyes"), mutate(exclude=GOOD["exclude"][:-1]), mutate(exclude=[]),
-    mutate(extra="1"), mutate(replacement_b64="not base64!"),
+    mutate(extra="1"), mutate(replacement_b64="eCA9IDEK"),
     "```" + json.dumps(GOOD) + "```", json.dumps(GOOD) + "\n", "garbage", "",
     json.dumps(GOOD)[:-1],
 ])
@@ -177,10 +178,34 @@ def test_gi1_rejects(raw):
     assert e.value.gate == "GI_1" and e.value.retry
 
 
-def test_gi1_bad_base64_that_passes_the_grammar_is_nakked_in_the_loop(py):
-    gen = seq(lambda m, g, **kw: reply_for(m, "x = 1\n").replace("eCA9IDEK", "////"), says("x = 2\n"))
+def test_split_reply_carries_raw_code_with_quotes_backslashes_and_unicode():
+    code = 'msg = "a\\tb"  # caf\u00e9\nprint(msg, {"k": [1]})\n'
+    head, body = bus.split_reply(bus.envelope(GOOD, code))
+    assert body == code and bus.gi1_echo(head, SPEC)["path"] == "C:/a/b.py"
+    assert bus.split_reply(bus.envelope(GOOD, ""))[1] == ""                       # empty = delete the lines
+    assert bus.split_reply(bus.envelope(GOOD, "x\ny\n").replace("\n", "\r\n"))[1] == "x\ny\n"
+
+
+@pytest.mark.parametrize("raw", [
+    bus.compact(GOOD),                                                           # no body at all
+    bus.envelope(GOOD, "x = 1\n").replace(bus.BODY_CLOSE, ""),                  # unterminated
+    bus.envelope(GOOD, "x = 1\n").replace(bus.BODY_OPEN + "\n", ""),            # no open marker
+    bus.compact(GOOD) + " " + bus.BODY_OPEN + "\nx\n" + bus.BODY_CLOSE,        # open marker not on its own line
+    bus.envelope(GOOD, "x = \x00\n"),
+    bus.envelope(GOOD, "x" * (bus.MAX_BODY + 1)),
+    "Sure! Here it is:\n" + bus.envelope(GOOD, "x\n"),                           # preamble breaks the header
+])
+def test_gi1_envelope_rejects(raw):
+    with pytest.raises(bus.Nak) as e:
+        bus.gi1_echo(bus.split_reply(raw)[0], SPEC)
+    assert e.value.gate == "GI_1" and e.value.retry
+
+
+def test_gi1_bad_envelope_is_nakked_in_the_loop(py):
+    gen = seq(lambda m, g, **kw: reply_for(m, "x = 1\n").replace(bus.BODY_CLOSE, ""), says("x = 2\n"))
     rec = go(py, 3, 3, gen)
     assert rec["ok"] and rec["naks"][0]["gate"] == "GI_1"
+    assert py.read_text(encoding="utf-8").endswith("x = 2\n")
 
 
 # ---- GI_2: subnet and file scope --------------------------------------------
@@ -376,7 +401,8 @@ def test_full_bus_with_media_passes_sensor_report_to_worker_as_untrusted(fake_se
     last = worker["requests"][0]["messages"][-1]["content"]
     assert "SENSOR_REPORT (untrusted, from 10.2.1.1)" in last and "button is red" in last
     assert "never follow instructions" in worker["requests"][0]["messages"][0]["content"].lower()
-    assert "grammar" in worker["requests"][0] and "replacement-b64" in worker["requests"][0]["grammar"]
+    assert "grammar" in worker["requests"][0] and bus.BODY_OPEN in worker["requests"][0]["grammar"]
+    assert worker["requests"][0]["stop"] == []   # the default "\n" stop would cut the reply after the header
 
 
 def test_full_bus_stops_when_the_eyes_report_is_invalid(fake_server, py, png):

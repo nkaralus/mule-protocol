@@ -19,7 +19,7 @@ never has to load large files or media into its own context. Every message betwe
 |---|---|---|
 | `SLOT_1_TASK` | Claude node | Task posted. **GI_2 scope**: file inside an allowed root, no `..`, not in `.git`, range in the file, ≤ 80 lines. |
 | `SLOT_2_PLAN` | Eyes node | With `--media`: Gemma returns an **EyesReport**. Otherwise a plain plan frame. |
-| `SLOT_3_EXECUTE` | Worker node | Qwen replies with one grammar-constrained block. **GI_1** echo check. |
+| `SLOT_3_EXECUTE` | Worker node | Qwen replies with one grammar-constrained header block, then the replacement as plain code between `<<<REPLACEMENT` and `REPLACEMENT>>>` lines. **GI_1** envelope + echo check. |
 | `SLOT_4_GUARD` | Harness | **GI_2** subnet check (a node may only speak from its own subnet and address), **GI_3** syntax check on a temp copy. Any gate failing is a **NAK**: back to slot 3 with the reason, up to **3** attempts. |
 | `SLOT_5_VERIFY` | Harness | Atomic write, read-back hash check, receipt. |
 
@@ -27,6 +27,38 @@ Gates: **GI_1** = `MuleValidator.validate_raw(raw, expect=…)` with every pinne
 (`frame_id`, `time_slot`, `subnet`, `op`, `target`, `ref`, `path`, `lines`) required to be echoed
 exactly, and all five standard exclusions present. **GI_2** = subnet isolation and file scope.
 **GI_3** = `py_compile` / `node --check` / `json.loads`. A failed patch is never written.
+
+Code never travels inside a mule block (`freeform_code_blocks`): the header block carries no payload,
+and the replacement follows it as raw text. The payload used to be `replacement_b64` inside the
+block, which a 14B model cannot encode reliably (every patch NAKed on GI_1/GI_3). The worker request
+also sends `stop: []`, because the runner's default `"\n"` stop would cut the reply after the header.
+
+## Completion gates (GI_4 / GI_5)
+
+`python ~/tools/mule_tool.py complete <frame.json> --root <repo>` checks a finished task against the
+files, not against anyone's word. The frame is a strict mule block (`SLOT_5_VERIFY`, Claude node, op
+`verify`, no unknown keys, no backslashes) built with `completion.completion_frame(...)`:
+
+```json
+{"frame_id":"0x0c0d","time_slot":"SLOT_5_VERIFY","subnet":"10.1.0.0/24","op":"verify","target":"%Claude",
+ "ref":"10.1.0.1","exclude":["..."],"base":"<commit sha before the task>",
+ "artifacts":["scripts/car.js"],"copies":["ref/car.png>RP/textures/car.png"],
+ "runtime":["scripts/main.js"],"hooks":["scripts/main.js::REGISTRATIONS = [registerCar]"],
+ "skipped":[],"tests_passed":true}
+```
+
+- **GI_4 artifacts / extraction completeness**: `skipped` must be empty (nothing "deferred to user");
+  every `artifacts` file exists and is not a stub; every `copies` source exists and its target is a
+  byte-for-byte copy (uncopied or replaced-by-placeholder fails). Stubs: empty files, markers (TODO,
+  FIXME, placeholder, stub, TBD, not implemented, deferred to user), Python functions that only
+  `pass` / `...` / `raise NotImplementedError`, empty JS function declarations, `{}` / `[]` JSON,
+  PNGs of 2x2 pixels or less.
+- **GI_5 dead wiring / stub-only tests**: every `runtime` file changed since `base` (committed,
+  staged, unstaged or new) and is not a stub; a change set of only test files is refused; every
+  `hooks` needle is present in its file outside comments. `tests_passed: true` overrides nothing.
+
+Paths are relative POSIX without spaces or `..`; hook needles cannot contain `"` or `\` (use single
+quotes). Exit 0 = complete, 1 = rejected (each reason printed, then a `RECEIPT:` line).
 
 ## Two steps
 
@@ -138,13 +170,13 @@ image directly when it is `down`, saying that the local sensor was offline.
 
 ## What is and is not guaranteed
 
-Guaranteed: both model replies are one JSON line with the exact pinned header; the payload is valid
-base64 UTF-8; the new file compiles/parses; nothing outside the allowed roots is touched; a failed
-patch never reaches disk.
+Guaranteed: both model replies start with one JSON line with the exact pinned header; the worker's
+replacement is delimited, NUL-free and at most 12288 characters; the new file compiles/parses;
+nothing outside the allowed roots is touched; a failed patch never reaches disk.
 
-Not guaranteed: that the patch does what you asked. A 14B model is weak at hand-encoding base64, so
-the prompt includes the slice already encoded (`CURRENT_SLICE_B64`) and NAKs feed the reason back.
-A syntactically valid wrong edit still passes. Review the printed diff, then run your tests.
+Not guaranteed: that the patch does what you asked. NAKs feed the reason back to the worker, but a
+syntactically valid wrong edit still passes. Review the printed diff, then run your tests. GI_4/GI_5
+catch skipped, stubbed and unwired work; they cannot tell whether real-looking code is correct.
 
 ## Troubleshooting
 

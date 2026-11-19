@@ -5,6 +5,7 @@
     mule_tool.py inspect <media> "<question>"                               look at media only
     mule_tool.py status                                                     which nodes can serve now
     mule_tool.py dlq [--tail N]                                             failed tasks (dlq.jsonl)
+    mule_tool.py complete <frame.json> [--root DIR]                         completion gates GI_4/GI_5
 
 A patch runs through bridge/bus.py (SLOT_1_TASK .. SLOT_5_VERIFY, gates GI_1..GI_3, up to 3 NAK
 retries on the worker) and prints a unified diff, an `OK:` / `REJECTED BY MULE:` line and a one-line
@@ -125,9 +126,32 @@ def cmd_dlq(argv: List[str]) -> int:
     return 0
 
 
+def cmd_complete(argv: List[str]) -> int:
+    """Check a completion frame against the files: declared artifacts real, runtime wired. No model involved."""
+    import completion
+    ap = argparse.ArgumentParser(prog="mule_tool.py complete")
+    ap.add_argument("frame", help="completion frame: a JSON file (one strict mule block)")
+    ap.add_argument("--root", default=".", help="directory the frame's paths are relative to (default: cwd)")
+    a = ap.parse_args(argv)
+    try:
+        raw = Path(a.frame).read_text(encoding="utf-8").strip()
+    except OSError as e:
+        print(f"REJECTED BY MULE: cannot read {a.frame}: {e}")
+        return 1
+    rec = completion.verify_completion(raw, Path(a.root))
+    if rec["ok"]:
+        print(f"OK: completion verified for frame {rec['frame_id']} under {rec['root']}")
+    else:
+        print("REJECTED BY MULE: task is not complete.")
+        for e in rec["errors"]:
+            print(f"  {e}")
+    print("RECEIPT: " + completion.receipt_json(rec))
+    return 0 if rec["ok"] else 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    cmds = {"inspect": cmd_inspect, "status": cmd_status, "dlq": cmd_dlq}
+    cmds = {"inspect": cmd_inspect, "status": cmd_status, "dlq": cmd_dlq, "complete": cmd_complete}
     if argv and argv[0] in cmds:
         return cmds[argv[0]](argv[1:])
     return cmd_patch(argv)
